@@ -9,6 +9,7 @@ import type {
 export type WhatsappProcessorPayload = {
   kind: 'message' | 'status';
   account_id: string;
+  correlation_id?: string;
   data: MetaIncomingMessageData | MetaIncomingStatusData;
 };
 
@@ -35,6 +36,7 @@ export class WhatsappOutboundClientService {
       JSON.stringify({
         event: 'whatsapp.event.forwarding',
         account_id: payload.account_id,
+        correlation_id: payload.correlation_id ?? null,
         phoneNumberId,
         provider,
       }),

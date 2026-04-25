@@ -1,219 +1,112 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { WhatsappIntegrationRepository } from '../repositories/whatsapp-integration.repository';
-import type { MetaIncomingParsed } from '../types/meta-whatsapp-incoming.types';
-import { WhatsappOutboundClientService } from './whatsapp-outbound-client.service';
+import { AccountResolver } from './account-resolver.service';
+import { EvolutionPayloadNormalizer } from './evolution-payload-normalizer.service';
+import { ProcessorForwarder } from './processor-forwarder.service';
 
 @Injectable()
 export class EvolutionWhatsappWebhookService {
   private readonly logger = new Logger(EvolutionWhatsappWebhookService.name);
+  private readonly seenMessages = new Map<string, number>();
+  private readonly dedupeWindowMs = this.resolveDedupeWindowMs();
 
   constructor(
-    private readonly whatsappOutboundClient: WhatsappOutboundClientService,
-    private readonly whatsappIntegrationRepository: WhatsappIntegrationRepository,
+    private readonly evolutionPayloadNormalizer: EvolutionPayloadNormalizer,
+    private readonly accountResolver: AccountResolver,
+    private readonly processorForwarder: ProcessorForwarder,
   ) {}
 
-  private parseIncoming(body: any): MetaIncomingParsed {
-    const data = body?.data ?? {};
-    const key = data?.key ?? {};
-    const message = data?.message ?? {};
-    const instanceRaw = body?.instance;
-    const instance =
-      typeof instanceRaw === 'string'
-        ? instanceRaw
-        : typeof instanceRaw?.instanceName === 'string'
-          ? instanceRaw.instanceName
-          : null;
-    const fromMe = key?.fromMe === true;
-
-    const remoteJid =
-      typeof key?.remoteJid === 'string' ? key.remoteJid.trim() : '';
-    const participant =
-      typeof key?.participant === 'string' ? key.participant.trim() : '';
-    const senderPhone = this.extractDigitsFromJid(participant || remoteJid);
-    const displayPhoneNumber = this.extractDigits(
-      body?.instance?.integration ?? body?.instance?.instanceName ?? null,
-    );
-    const phoneNumberId = this.extractDigits(
-      body?.instance?.instanceId ?? body?.instance?.instanceName ?? null,
-    );
-
-    const messageId = key?.id ?? body?.event_id ?? null;
-    const timestamp = data?.messageTimestamp
-      ? String(data.messageTimestamp)
-      : null;
-    const textBody =
-      message?.conversation ??
-      message?.extendedTextMessage?.text ??
-      message?.imageMessage?.caption ??
-      message?.videoMessage?.caption ??
-      null;
-
-    const isMessageEvent =
-      body?.event === 'messages.upsert' &&
-      typeof remoteJid === 'string' &&
-      remoteJid.length > 0 &&
-      !fromMe;
-
-    if (isMessageEvent) {
-      return {
-        kind: 'message',
-        data: {
-          messagingProduct: 'whatsapp',
-          displayPhoneNumber,
-          phoneNumberId,
-          rawInstance: instance,
-          customerWaId: senderPhone,
-          customerName: data?.pushName ?? null,
-          messageId,
-          from: senderPhone,
-          timestamp,
-          type: this.detectMessageType(message),
-          textBody,
-        },
-      };
-    }
-
-    const statusName = this.detectStatus(body);
-    if (statusName) {
-      return {
-        kind: 'status',
-        data: {
-          phoneNumberId,
-          displayPhoneNumber,
-          rawInstance: instance,
-          messageId,
-          status: statusName,
-          timestamp,
-          recipientId: senderPhone,
-        },
-      };
-    }
-
-    return {
-      kind: 'unknown',
-      data: {
-        rawObject: body?.event ?? null,
-        hasEntry: false,
-        changeField: body?.event ?? null,
-      },
-    };
-  }
-
-  processIncoming(body: any): void {
-    const parsed = this.parseIncoming(body);
-
-    if (parsed.kind === 'message') {
+  async processIncoming(body: any): Promise<void> {
+    const parsed = this.evolutionPayloadNormalizer.normalize(body);
+    if (parsed.kind === 'ignored') {
       this.logger.log(
         JSON.stringify({
-          event: 'whatsapp.evolution.message.normalized',
-          messageId: parsed.data.messageId ?? null,
-          from: parsed.data.from ?? null,
-          phoneNumberId: parsed.data.phoneNumberId ?? null,
+          event: 'whatsapp.evolution.webhook.ignored',
+          reason: parsed.reason,
+          correlation_id: parsed.correlationId,
         }),
       );
-    } else if (parsed.kind === 'status') {
-      this.logger.log(
-        `EVOLUTION WEBHOOK STATUS: ${JSON.stringify(parsed.data)}`,
-      );
-    } else {
-      this.logger.log(
-        `EVOLUTION WEBHOOK EVENTO NÃO MAPEADO: ${JSON.stringify(parsed.data)}`,
-      );
-    }
-
-    if (parsed.kind !== 'message' && parsed.kind !== 'status') {
       return;
     }
 
-    const instance =
-      typeof parsed.data.rawInstance === 'string'
-        ? parsed.data.rawInstance.trim()
-        : '';
-    let accountId =
-      this.whatsappIntegrationRepository.resolveEvolutionAccountId(instance);
-
-    if (accountId) {
-      this.logger.log(
-        JSON.stringify({
-          event: 'whatsapp.evolution.account.resolved',
-          resolver: 'instance',
-          instance: instance || null,
-          account_id: accountId,
-        }),
-      );
+    if (this.isDuplicate(parsed.dedupeKey, parsed.correlationId)) {
+      return;
     }
 
-    if (!accountId && process.env.PROCESSOR_ACCOUNT_ID?.trim()) {
-      this.logger.warn(
-        'account_id via PROCESSOR_ACCOUNT_ID (legado). Para multi-tenant, use WHATSAPP_INTEGRATIONS_JSON.',
-      );
-      accountId = process.env.PROCESSOR_ACCOUNT_ID.trim();
-      this.logger.log(
-        JSON.stringify({
-          event: 'whatsapp.evolution.account.resolved',
-          resolver: 'processor_account_id',
-          instance: instance || null,
-          account_id: accountId,
-        }),
-      );
-    }
+    this.logger.log(
+      JSON.stringify({
+        event: `whatsapp.evolution.${parsed.kind}.normalized`,
+        correlation_id: parsed.correlationId,
+        messageId: parsed.data.messageId ?? null,
+        from: parsed.kind === 'message' ? parsed.data.from ?? null : null,
+        instance: parsed.data.rawInstance ?? null,
+      }),
+    );
+
+    const accountId = this.accountResolver.resolve({
+      instanceName: parsed.data.rawInstance ?? null,
+      phoneNumberId: parsed.data.phoneNumberId ?? null,
+      displayPhoneNumber: parsed.data.displayPhoneNumber ?? null,
+      correlationId: parsed.correlationId,
+    });
 
     if (!accountId) {
       this.logger.warn(
-        `Evento WhatsApp Evolution não encaminhado: integração não encontrada para instance=${instance || '(nulo)'}`,
+        JSON.stringify({
+          event: 'whatsapp.evolution.account.not_found',
+          correlation_id: parsed.correlationId,
+          instance: parsed.data.rawInstance ?? null,
+          phoneNumberId: parsed.data.phoneNumberId ?? null,
+          displayPhoneNumber: parsed.data.displayPhoneNumber ?? null,
+        }),
       );
       return;
     }
 
-    void this.whatsappOutboundClient.sendEvent(
-      {
-        kind: parsed.kind,
-        account_id: accountId,
-        data: parsed.data,
-      },
-      'evolution',
-    );
+    await this.processorForwarder.forward({
+      kind: parsed.kind,
+      account_id: accountId,
+      correlation_id: parsed.correlationId,
+      data: parsed.data,
+    });
   }
 
-  private detectMessageType(message: any): string | null {
-    if (message?.conversation || message?.extendedTextMessage) {
-      return 'text';
+  private isDuplicate(
+    dedupeKey: string | null,
+    correlationId: string,
+  ): boolean {
+    if (!dedupeKey) {
+      return false;
     }
-    const keys = Object.keys(message ?? {}).filter(Boolean);
-    if (keys.length === 0) {
-      return null;
+    const now = Date.now();
+    this.pruneSeenMessages(now);
+    if (this.seenMessages.has(dedupeKey)) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'whatsapp.evolution.duplicate.ignored',
+          correlation_id: correlationId,
+          messageId: dedupeKey,
+        }),
+      );
+      return true;
     }
-    return keys[0].replace(/Message$/, '').toLowerCase();
+    this.seenMessages.set(dedupeKey, now);
+    return false;
   }
 
-  private detectStatus(body: any): string | null {
-    const event = String(body?.event ?? '').toLowerCase();
-    if (event.includes('delivery') || event.includes('delivered')) {
-      return 'delivered';
+  private pruneSeenMessages(now: number): void {
+    for (const [messageId, seenAt] of this.seenMessages.entries()) {
+      if (now - seenAt > this.dedupeWindowMs) {
+        this.seenMessages.delete(messageId);
+      }
     }
-    if (event.includes('read')) {
-      return 'read';
-    }
-    if (event.includes('sent')) {
-      return 'sent';
-    }
-    return null;
   }
 
-  private extractDigits(value: unknown): string | null {
-    if (typeof value !== 'string' || value.trim().length === 0) {
-      return null;
+  private resolveDedupeWindowMs(): number {
+    const raw = process.env.EVOLUTION_DEDUPE_WINDOW_MS;
+    const parsed = Number.parseInt(raw ?? '', 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
     }
-    const digits = value.replace(/\D/g, '');
-    return digits.length > 0 ? digits : null;
-  }
-
-  private extractDigitsFromJid(value: unknown): string | null {
-    if (typeof value !== 'string' || value.trim().length === 0) {
-      return null;
-    }
-    const jid = value.split('@')[0];
-    const digits = jid.replace(/\D/g, '');
-    return digits.length > 0 ? digits : null;
+    return 5 * 60 * 1000;
   }
 }
